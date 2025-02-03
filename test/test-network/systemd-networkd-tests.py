@@ -5025,6 +5025,27 @@ class NetworkdDHCPClientTests(unittest.TestCase, Utilities):
         self.assertNotIn('192.168.5.', output)
         self.assertIn('inet 169.254.133.11/16 metric 2048 brd 169.254.255.255 scope link', output)
 
+    def test_bootp_client(self):
+        copy_network_unit('25-veth.netdev', '25-dhcp-server-veth-peer.network', '25-bootp-client.network')
+        start_networkd()
+        self.wait_online('veth-peer:carrier')
+
+        start_dnsmasq('--dhcp-host=12:34:56:78:9a:bc,192.168.5.42,trixie-mule')
+        # def wait_online(self, *links_with_operstate, timeout='20s', bool_any=False, ipv4=False, ipv6=False, setup_state='configured', setup_timeout=5):
+        self.wait_online('veth99:routable', 'veth-peer:routable')
+        self.wait_address('veth99', r'inet 192.168.5.[0-9]*/24', ipv='-4')
+
+        state = get_dhcp4_client_state('veth99')
+        print(f"DHCPv4 client state = {state}")
+        self.assertEqual(state, 'bound')
+
+        output = read_dnsmasq_log_file()
+        self.assertIn('BOOTP(veth-peer)', output)
+        self.assertNotIn('DHCPDISCOVER(veth-peer)', output)
+        self.assertNotIn('DHCPOFFER(veth-peer)', output)
+        self.assertNotIn('DHCPREQUEST(veth-peer)', output)
+        self.assertNotIn('DHCPACK(veth-peer)', output)
+
     def test_dhcp_client_use_dns(self):
         def check(self, ipv4, ipv6):
             os.makedirs(os.path.join(network_unit_dir, '25-dhcp-client.network.d'), exist_ok=True)

@@ -1,0 +1,674 @@
+--- a/src/libsystemd-network/dhcp-internal.h
++++ b/src/libsystemd-network/dhcp-internal.h
+@@ -57,6 +57,9 @@
+ 
+ int dhcp_option_parse(DHCPMessage *message, size_t len, dhcp_option_callback_t cb, void *userdata, char **error_message);
+ 
++int bootp_message_init(DHCPMessage *message, uint8_t op, uint32_t xid,
++                      uint16_t arp_type, uint8_t hlen, const uint8_t *chaddr);
++
+ int dhcp_message_init(DHCPMessage *message, uint8_t op, uint32_t xid,
+                       uint8_t type, uint16_t arp_type, uint8_t hlen, const uint8_t *chaddr,
+                       size_t optlen, size_t *optoffset);
+--- a/src/libsystemd-network/dhcp-packet.c
++++ b/src/libsystemd-network/dhcp-packet.c
+@@ -14,6 +14,33 @@
+ 
+ #define DHCP_CLIENT_MIN_OPTIONS_SIZE            312
+ 
++int bootp_message_init(DHCPMessage *message, uint8_t op, uint32_t xid, uint16_t arp_type, uint8_t hlen, const uint8_t *chaddr) {
++        assert(IN_SET(op, BOOTREQUEST, BOOTREPLY));
++        assert(chaddr || hlen == 0);
++
++        message->op = op;
++        message->htype = arp_type;
++
++        /* RFC2131 section 4.1.1:
++           The client MUST include its hardware address in the ’chaddr’ field, if
++           necessary for delivery of DHCP reply messages.
++
++           RFC 4390 section 2.1:
++           A DHCP client, when working over an IPoIB interface, MUST follow the
++           following rules:
++           "htype" (hardware address type) MUST be 32 [ARPPARAM].
++           "hlen" (hardware address length) MUST be 0.
++           "chaddr" (client hardware address) field MUST be zeroed.
++         */
++        message->hlen = arp_type == ARPHRD_INFINIBAND ? 0 : hlen;
++        memcpy_safe(message->chaddr, chaddr, message->hlen);
++
++        message->xid = htobe32(xid);
++        message->magic = htobe32(DHCP_MAGIC_COOKIE);
++
++        return 0;
++}
++
+ int dhcp_message_init(
+                 DHCPMessage *message,
+                 uint8_t op,
+--- a/src/libsystemd-network/sd-dhcp-client.c
++++ b/src/libsystemd-network/sd-dhcp-client.c
+@@ -116,6 +116,7 @@
+         sd_dhcp_lease *lease;
+         usec_t start_delay;
+         int ip_service_type;
++        bool bootp;
+ 
+         /* Ignore ifindex when generating iaid. See dhcp_identifier_set_iaid(). */
+         bool test_mode;
+@@ -651,6 +652,19 @@
+         return 0;
+ }
+ 
++int sd_dhcp_client_set_bootp(sd_dhcp_client *client, int bootp) {
++        assert_return(client, -EINVAL);
++        assert_return(!sd_dhcp_client_is_running(client), -EBUSY);
++
++        client->bootp = bootp;
++
++        /* For BOOTP mode, we don't want to send any request options by default. */
++        set_free(client->req_opts);
++        client->req_opts = NULL;
++
++        return 0;
++}
++
+ static int client_notify(sd_dhcp_client *client, int event) {
+         assert(client);
+ 
+@@ -759,9 +773,15 @@
+         if (!packet)
+                 return -ENOMEM;
+ 
+-        r = dhcp_message_init(&packet->dhcp, BOOTREQUEST, client->xid, type,
+-                              client->arp_type, client->hw_addr.length, client->hw_addr.bytes,
+-                              optlen, &optoffset);
++        if (client->bootp) {
++                optoffset = 0;
++                r = bootp_message_init(&packet->dhcp, BOOTREQUEST, client->xid, client->arp_type,
++                                       client->hw_addr.length, client->hw_addr.bytes);
++        } else
++                r = dhcp_message_init(&packet->dhcp, BOOTREQUEST, client->xid, type,
++                                      client->arp_type, client->hw_addr.length, client->hw_addr.bytes,
++                                      optlen, &optoffset);
++
+         if (r < 0)
+                 return r;
+ 
+@@ -791,35 +811,38 @@
+         if (client->request_broadcast || client->arp_type != ARPHRD_ETHER)
+                 packet->dhcp.flags = htobe16(0x8000);
+ 
+-        /* If no client identifier exists, construct an RFC 4361-compliant one */
+-        if (client->client_id_len == 0) {
+-                size_t duid_len;
+-
+-                client->client_id.type = 255;
+-
+-                r = dhcp_identifier_set_iaid(client->ifindex, &client->hw_addr,
+-                                             /* legacy_unstable_byteorder = */ true,
+-                                             /* use_mac = */ client->test_mode,
+-                                             &client->client_id.ns.iaid);
+-                if (r < 0)
+-                        return r;
++        if (!client->bootp) {
++                /* Some DHCP servers will refuse to issue an DHCP lease if the Client
++                Identifier option is not set */
++
++                /* If no client identifier exists, construct an RFC 4361-compliant one */
++                if (client->client_id_len == 0) {
++                        size_t duid_len;
+ 
+-                r = dhcp_identifier_set_duid_en(client->test_mode, &client->client_id.ns.duid, &duid_len);
+-                if (r < 0)
+-                        return r;
++                        client->client_id.type = 255;
+ 
+-                client->client_id_len = sizeof(client->client_id.type) + sizeof(client->client_id.ns.iaid) + duid_len;
+-        }
++                        r = dhcp_identifier_set_iaid(client->ifindex, &client->hw_addr,
++                                                /* legacy_unstable_byteorder = */ true,
++                                                /* use_mac = */ client->test_mode,
++                                                &client->client_id.ns.iaid);
++                        if (r < 0)
++                                return r;
+ 
+-        /* Some DHCP servers will refuse to issue an DHCP lease if the Client
+-           Identifier option is not set */
+-        if (client->client_id_len) {
+-                r = dhcp_option_append(&packet->dhcp, optlen, &optoffset, 0,
+-                                       SD_DHCP_OPTION_CLIENT_IDENTIFIER,
+-                                       client->client_id_len,
+-                                       &client->client_id);
+-                if (r < 0)
+-                        return r;
++                        r = dhcp_identifier_set_duid_en(client->test_mode, &client->client_id.ns.duid, &duid_len);
++                        if (r < 0)
++                                return r;
++
++                        client->client_id_len = sizeof(client->client_id.type) + sizeof(client->client_id.ns.iaid) + duid_len;
++                }
++
++                if (client->client_id_len) {
++                        r = dhcp_option_append(&packet->dhcp, optlen, &optoffset, 0,
++                                        SD_DHCP_OPTION_CLIENT_IDENTIFIER,
++                                        client->client_id_len,
++                                        &client->client_id);
++                        if (r < 0)
++                                return r;
++                }
+         }
+ 
+         /* RFC2131 section 3.5:
+@@ -835,7 +858,7 @@
+            MAY contain the Parameter Request List option. */
+         /* NOTE: in case that there would be an option to do not send
+          * any PRL at all, the size should be checked before sending */
+-        if (!set_isempty(client->req_opts) && type != DHCP_RELEASE) {
++        if (!set_isempty(client->req_opts) && type != DHCP_RELEASE && !client->bootp) {
+                 _cleanup_free_ uint8_t *opts = NULL;
+                 size_t n_opts, i = 0;
+                 void *val;
+@@ -883,7 +906,7 @@
+          */
+         /* RFC7844 section 3:
+            SHOULD NOT contain any other option. */
+-        if (!client->anonymize && IN_SET(type, DHCP_DISCOVER, DHCP_REQUEST)) {
++        if (!client->bootp && !client->anonymize && IN_SET(type, DHCP_DISCOVER, DHCP_REQUEST)) {
+                 be16_t max_size = htobe16(MIN(client->mtu - DHCP_IP_UDP_SIZE, (uint32_t) UINT16_MAX));
+                 r = dhcp_option_append(&packet->dhcp, optlen, &optoffset, 0,
+                                        SD_DHCP_OPTION_MAXIMUM_MESSAGE_SIZE,
+@@ -1026,7 +1049,7 @@
+          */
+         /* RFC7844 section 3:
+            SHOULD NOT contain any other option. */
+-        if (!client->anonymize && client->last_addr != INADDR_ANY) {
++        if (!client->bootp && !client->anonymize && client->last_addr != INADDR_ANY) {
+                 r = dhcp_option_append(&discover->dhcp, optlen, &optoffset, 0,
+                                        SD_DHCP_OPTION_REQUESTED_IP_ADDRESS,
+                                        4, &client->last_addr);
+@@ -1034,15 +1057,34 @@
+                         return r;
+         }
+ 
+-        r = client_append_common_discover_request_options(client, discover, &optoffset, optlen);
+-        if (r < 0)
+-                return r;
++        if (!client->bootp) {
++                r = client_append_common_discover_request_options(client, discover, &optoffset, optlen);
++                if (r < 0)
++                        return r;
++        }
+ 
+         r = dhcp_option_append(&discover->dhcp, optlen, &optoffset, 0,
+                                SD_DHCP_OPTION_END, 0, NULL);
+         if (r < 0)
+                 return r;
+ 
++       /* RFC1542 section 3.5:
++         * if the client has no information to communicate to the server,
++         * the octet immediately following the magic cookie SHOULD be set
++         * to the "End" tag (255) and the remaining octets of the 'vend'
++         * field SHOULD be set to zero.
++         */
++        /* Use this RFC, along with the fact that some BOOTP servers require
++         * a 64-byte vend field, to suggest that we always zero and send 64
++         * bytes in the options field. The first four bites are the "magic"
++         * field, so this only needs to add 60 bytes.
++         */
++        if (client->bootp)
++                if (optoffset < 60 && optlen >= 60) {
++                        memset(&discover->dhcp.options[optoffset], 0, optlen - optoffset);
++                        optoffset = 60;
++                }
++
+         /* We currently ignore:
+            The client SHOULD wait a random time between one and ten seconds to
+            desynchronize the use of DHCP at startup.
+@@ -1465,10 +1507,28 @@
+ 
+         r = dhcp_option_parse(offer, len, dhcp_lease_parse_options, lease, NULL);
+         if (r != DHCP_OFFER) {
+-                log_dhcp_client(client, "received message was not an OFFER, ignoring");
+-                return -ENOMSG;
++                if (r == -ENOMSG && client->bootp) {
++                        // Treat a non-DHCP BOOTREPLY like a DHCP ACK, so keep processing
++                        log_dhcp_client(client, "BOOTREPLY received");
++                        r = DHCP_ACK;
++                } else {
++                        log_dhcp_client(client, "received message was not an OFFER, ignoring");
++                        return -ENOMSG;
++                }
+         }
+ 
++        if (client->bootp) {
++                // This was USEC_INFINITY in systemd v258, but that's a long unsigned int; casting doesn't seem like a good idea
++                lease->lifetime = UINT32_MAX;
++                log_dhcp_client(client, "Using infinite lease. BOOTP siaddr=(%#x), DHCP Server Identifier=(%#x)",
++                        offer->siaddr,
++                        lease->server_address);
++
++                lease->server_address = offer->siaddr ? offer->siaddr : lease->server_address;
++                lease->next_server = 0;
++        } else
++                lease->next_server = offer->siaddr;
++
+         lease->next_server = offer->siaddr;
+         lease->address = offer->yiaddr;
+ 
+@@ -1478,7 +1538,11 @@
+         if (lease->address == 0 ||
+             lease->server_address == 0 ||
+             lease->lifetime == 0) {
+-                log_dhcp_client(client, "received lease lacks address, server address or lease lifetime, ignoring");
++                log_dhcp_client(client, "received lease lacks address(%#x), server address(%#x) or lease lifetime(%#llx), ignoring.",
++                        lease->address,
++                        lease->server_address,
++                        (unsigned long long) lease->lifetime
++                );
+                 return -ENOMSG;
+         }
+ 
+@@ -1498,7 +1562,10 @@
+         if (client_notify(client, SD_DHCP_CLIENT_EVENT_SELECTING) < 0)
+                 return -ENOMSG;
+ 
+-        log_dhcp_client(client, "OFFER");
++        if (client->bootp)
++                log_dhcp_client(client, "BOOTREPLY");
++        else
++                log_dhcp_client(client, "OFFER");
+ 
+         return 0;
+ }
+@@ -1551,8 +1618,8 @@
+ 
+         if (client->client_id_len) {
+                 r = dhcp_lease_set_client_id(lease,
+-                                             (uint8_t *) &client->client_id,
+-                                             client->client_id_len);
++                                        (uint8_t *) &client->client_id,
++                                        client->client_id_len);
+                 if (r < 0)
+                         return r;
+         }
+@@ -1575,8 +1642,11 @@
+         if (lease->address == INADDR_ANY ||
+             lease->server_address == INADDR_ANY ||
+             lease->lifetime == 0) {
+-                log_dhcp_client(client, "received lease lacks address, server "
+-                                "address or lease lifetime, ignoring");
++                log_dhcp_client(client, "received lease lacks address(%#x), server address(%#x) or lease lifetime(%#llx), ignoring.",
++                        lease->address,
++                        lease->server_address,
++                        (unsigned long long) lease->lifetime
++                );
+                 return -ENOMSG;
+         }
+ 
+@@ -1729,14 +1799,25 @@
+                                      0, 0,
+                                      client_timeout_resend, client,
+                                      client->event_priority, "dhcp4-resend-timer", true);
+-                break;
++
++                // Treat a non-DHCP BOOTREPLY like a DHCP ACK, so allow
++                // fall through to the next case for these.
++                if (! client->bootp)
++                        break;
++                [[fallthrough]];
+ 
+         case DHCP_STATE_REBOOTING:
+         case DHCP_STATE_REQUESTING:
+         case DHCP_STATE_RENEWING:
+         case DHCP_STATE_REBINDING:
++                if (client->bootp)
++                        if (client->state == DHCP_STATE_REQUESTING)
++                                r = SD_DHCP_CLIENT_EVENT_IP_ACQUIRE;
++                        else
++                                r = SD_DHCP_CLIENT_EVENT_RENEW;
++                else
++                        r = client_handle_ack(client, message, len);
+ 
+-                r = client_handle_ack(client, message, len);
+                 if (r == -ENOMSG)
+                         return 0; /* invalid message, let's ignore it */
+                 if (r == -EADDRNOTAVAIL) {
+--- a/src/libsystemd-network/test-dhcp-client.c
++++ b/src/libsystemd-network/test-dhcp-client.c
+@@ -32,6 +32,14 @@
+ };
+ typedef int (*test_callback_recv_t)(size_t size, DHCPMessage *dhcp);
+ 
++struct bootp_addr_data {
++        uint8_t *offer_buf;
++        int offer_len;
++        int netmask_offset;
++        int ip_offset;
++};
++struct bootp_addr_data *bootp_test_context;
++
+ static bool verbose = true;
+ static int test_fd[2];
+ static test_callback_recv_t callback_recv;
+@@ -531,6 +539,204 @@
+         xid = 0;
+ }
+ 
++static uint8_t test_addr_bootp_reply[] = {
++        0x45, 0x00, 0x01, 0x48, 0x00, 0x00, 0x40, 0x00,
++        0xff, 0x11, 0x70, 0xa3, 0x0a, 0x00, 0x00, 0x02,
++        0xff, 0xff, 0xff, 0xff, 0x00, 0x43, 0x00, 0x44,
++        0x01, 0x2c, 0x2b, 0x91, 0x02, 0x01, 0x06, 0x00,
++        0x69, 0xd3, 0x79, 0x11, 0x17, 0x00, 0x80, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x0a, 0x46, 0x00, 0x02,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x50, 0x2d, 0xf4, 0x1f, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x63, 0x82, 0x53, 0x63, 0x01, 0x04, 0xff, 0x00,
++        0x00, 0x00, 0x36, 0x04, 0x0a, 0x00, 0x00, 0x02,
++        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++};
++
++static uint8_t test_addr_bootp_reply_bootpd[] = {
++        0x45, 0x00, 0x01, 0x48, 0xbe, 0xad, 0x40, 0x00,
++        0x40, 0x11, 0x73, 0x43, 0xc0, 0xa8, 0x43, 0x31,
++        0xc0, 0xa8, 0x43, 0x32, 0x00, 0x43, 0x00, 0x44,
++        0x01, 0x34, 0x08, 0xfa, 0x02, 0x01, 0x06, 0x00,
++        0x82, 0x57, 0xda, 0xf1, 0x00, 0x01, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0xc0, 0xa8, 0x43, 0x32,
++        0xc0, 0xa8, 0x43, 0x31, 0x00, 0x00, 0x00, 0x00,
++        0xc2, 0x3e, 0xa5, 0x53, 0x57, 0x72, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x64, 0x65, 0x62, 0x69, 0x61, 0x6e, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x63, 0x82, 0x53, 0x63, 0x01, 0x04, 0xff, 0xff,
++        0xff, 0xf0, 0x03, 0x04, 0xc0, 0xa8, 0x43, 0x31,
++        0x06, 0x04, 0x0a, 0x00, 0x01, 0x01, 0x0c, 0x15,
++        0x63, 0x6c, 0x69, 0x65, 0x6e, 0x74, 0x2d, 0x64,
++        0x65, 0x66, 0x61, 0x75, 0x6c, 0x74, 0x2d, 0x74,
++        0x72, 0x69, 0x78, 0x69, 0x65, 0xff, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++};
++
++static struct bootp_addr_data bootp_addr_data[] = {
++        {
++                .offer_buf = test_addr_bootp_reply,
++                .offer_len = sizeof(test_addr_bootp_reply),
++                .netmask_offset = 270,
++                .ip_offset = 44,
++        },
++        {
++                .offer_buf = test_addr_bootp_reply_bootpd,
++                .offer_len = sizeof(test_addr_bootp_reply_bootpd),
++                .netmask_offset = 270,
++                .ip_offset = 44,
++        },
++};
++
++static int test_bootp_acquired(sd_dhcp_client *client, int event,
++                               void *userdata) {
++        sd_event *e = userdata;
++        sd_dhcp_lease *lease;
++        struct in_addr addr;
++
++        assert_se(client);
++        assert_se(IN_SET(event, SD_DHCP_CLIENT_EVENT_IP_ACQUIRE, SD_DHCP_CLIENT_EVENT_SELECTING));
++
++        assert_se(sd_dhcp_client_get_lease(client, &lease) >= 0);
++        assert_se(lease);
++
++        assert_se(sd_dhcp_lease_get_address(lease, &addr) >= 0);
++        assert_se(memcmp(&addr.s_addr, &bootp_test_context->offer_buf[bootp_test_context->ip_offset],
++                      sizeof(addr.s_addr)) == 0);
++
++        assert_se(sd_dhcp_lease_get_netmask(lease, &addr) >= 0);
++        assert_se(memcmp(&addr.s_addr, &bootp_test_context->offer_buf[bootp_test_context->netmask_offset],
++                      sizeof(addr.s_addr)) == 0);
++
++        if (verbose)
++                log_info("  BOOTP address acquired");
++
++        sd_event_exit(e, 0);
++
++        return 0;
++}
++
++static int test_bootp_recv_request(size_t size, DHCPMessage *request) {
++        uint16_t udp_check = 0;
++        int res;
++
++        xid = request->xid;
++
++        if (verbose)
++                log_info("  recv BOOTP Request  0x%08x", be32toh(xid));
++
++        callback_recv = NULL;
++
++        memcpy(&bootp_test_context->offer_buf[26], &udp_check, sizeof(udp_check));
++        memcpy(&bootp_test_context->offer_buf[32], &xid, sizeof(xid));
++        memcpy(&bootp_test_context->offer_buf[56], hw_addr.bytes, hw_addr.length);
++
++        res = write(test_fd[1], bootp_test_context->offer_buf,
++                    bootp_test_context->offer_len);
++        assert_se(res == bootp_test_context->offer_len);
++
++        if (verbose)
++                log_info("  sent BOOTP Reply");
++
++        return 0;
++};
++
++static void test_acquire_bootp(sd_event *e) {
++        sd_dhcp_client *client;
++        int res, r;
++
++        if (verbose)
++                log_info("* %s", __func__);
++
++        r = sd_dhcp_client_new(&client, false);
++        assert_se(r >= 0);
++        assert_se(client);
++
++        r = sd_dhcp_client_attach_event(client, e, 0);
++        assert_se(r >= 0);
++
++        r = sd_dhcp_client_set_bootp(client, true);
++        assert_se(r >= 0);
++
++        assert_se(sd_dhcp_client_set_ifindex(client, 42) >= 0);
++        assert_se(sd_dhcp_client_set_mac(client, hw_addr.bytes, bcast_addr.bytes, hw_addr.length, ARPHRD_ETHER) >= 0);
++
++        assert_se(sd_dhcp_client_set_callback(client, test_bootp_acquired, e) >= 0);
++
++        callback_recv = test_bootp_recv_request;
++
++        assert_se(sd_event_add_time_relative(e, NULL, CLOCK_BOOTTIME,
++                                             30 * USEC_PER_SEC, 0,
++                                             NULL, INT_TO_PTR(-ETIMEDOUT)) >= 0);
++
++        res = sd_dhcp_client_start(client);
++        assert_se(IN_SET(res, 0, -EINPROGRESS));
++
++        assert_se(sd_event_loop(e) >= 0);
++
++        assert_se(sd_dhcp_client_set_callback(client, NULL, NULL) >= 0);
++        assert_se(sd_dhcp_client_stop(client) >= 0);
++        sd_dhcp_client_unref(client);
++
++        test_fd[1] = safe_close(test_fd[1]);
++
++        callback_recv = NULL;
++        xid = 0;
++}
++
+ int main(int argc, char *argv[]) {
+         _cleanup_(sd_event_unrefp) sd_event *e;
+ 
+@@ -546,6 +752,13 @@
+         test_discover_message(e);
+         test_addr_acq(e);
+ 
++        for (size_t i = 0; i < sizeof(bootp_addr_data) / sizeof(bootp_addr_data[0]); i++) {
++                sd_event_unref(e);
++                assert_se(sd_event_new(&e) >= 0);
++                bootp_test_context = &bootp_addr_data[i];
++                test_acquire_bootp(e);
++        }
++
+ #if VALGRIND
+         /* Make sure the async_close thread has finished.
+          * valgrind would report some of the phread_* structures
+--- a/src/network/networkd-dhcp4.c
++++ b/src/network/networkd-dhcp4.c
+@@ -1360,6 +1360,12 @@
+         if (r < 0)
+                 return log_link_debug_errno(link, r, "DHCPv4 CLIENT: Failed to allocate DHCPv4 client: %m");
+ 
++        if (link->network->dhcp_send_bootp) {
++                r = sd_dhcp_client_set_bootp(link->dhcp_client, link->network->dhcp_send_bootp);
++                if (r < 0)
++                        return log_link_debug_errno(link, r, "DHCPv4 CLIENT: Failed to set BOOTP flag: %m");
++        }
++
+         r = sd_dhcp_client_attach_event(link->dhcp_client, link->manager->event, 0);
+         if (r < 0)
+                 return log_link_debug_errno(link, r, "DHCPv4 CLIENT: Failed to attach event to DHCPv4 client: %m");
+--- a/src/network/networkd-network-gperf.gperf
++++ b/src/network/networkd-network-gperf.gperf
+@@ -223,7 +223,7 @@
+ DHCPv4.UseGateway,                           config_parse_tristate,                                    0,                             offsetof(Network, dhcp_use_gateway)
+ DHCPv4.RequestOptions,                       config_parse_dhcp_request_options,                        AF_INET,                       0
+ DHCPv4.Anonymize,                            config_parse_bool,                                        0,                             offsetof(Network, dhcp_anonymize)
+-DHCPv4.SendHostname,                         config_parse_bool,                                        0,                             offsetof(Network, dhcp_send_hostname)
++DHCPv4.BOOTP,                                config_parse_bool,                                        0,                             offsetof(Network, dhcp_send_bootp)
+ DHCPv4.Hostname,                             config_parse_hostname,                                    0,                             offsetof(Network, dhcp_hostname)
+ DHCPv4.Label,                                config_parse_dhcp_label,                                  0,                             offsetof(Network, dhcp_label)
+ DHCPv4.RequestBroadcast,                     config_parse_tristate,                                    0,                             offsetof(Network, dhcp_broadcast)
+--- a/src/network/networkd-network.h
++++ b/src/network/networkd-network.h
+@@ -156,6 +156,7 @@
+         OrderedHashmap *dhcp_client_send_options;
+         OrderedHashmap *dhcp_client_send_vendor_options;
+         char *dhcp_netlabel;
++        bool dhcp_send_bootp;
+ 
+         /* DHCPv6 Client support */
+         bool dhcp6_use_address;
+--- a/src/systemd/sd-dhcp-client.h
++++ b/src/systemd/sd-dhcp-client.h
+@@ -311,6 +311,9 @@
+ int sd_dhcp_client_set_fallback_lease_lifetime(
+                 sd_dhcp_client *client,
+                 uint32_t fallback_lease_lifetime);
++int sd_dhcp_client_set_bootp(
++                sd_dhcp_client *client,
++                int bootp);
+ 
+ int sd_dhcp_client_add_option(sd_dhcp_client *client, sd_dhcp_option *v);
+ int sd_dhcp_client_add_vendor_option(sd_dhcp_client *client, sd_dhcp_option *v);
+--- a/test/fuzz/fuzz-network-parser/directives
++++ b/test/fuzz/fuzz-network-parser/directives
+@@ -104,7 +104,7 @@
+ UseMTU=
+ UseDomainName=
+ RouteMetric=
+-SendHostname=
++BOOTP=
+ Anonymize=
+ VendorClassIdentifier=
+ Hostname=
+--- /dev/null
++++ b/test/test-network/conf/25-bootp-client.network
+@@ -0,0 +1,9 @@
++# SPDX-License-Identifier: LGPL-2.1-or-later
++[Match]
++Name=veth99
++
++[Network]
++DHCP=ipv4
++
++[DHCPv4]
++BOOTP=yes
+\ No newline at end of file
+--- a/test/test-network/systemd-networkd-tests.py
++++ b/test/test-network/systemd-networkd-tests.py
+@@ -5025,6 +5025,27 @@
+         self.assertNotIn('192.168.5.', output)
+         self.assertIn('inet 169.254.133.11/16 metric 2048 brd 169.254.255.255 scope link', output)
+ 
++    def test_bootp_client(self):
++        copy_network_unit('25-veth.netdev', '25-dhcp-server-veth-peer.network', '25-bootp-client.network')
++        start_networkd()
++        self.wait_online('veth-peer:carrier')
++
++        start_dnsmasq('--dhcp-host=12:34:56:78:9a:bc,192.168.5.42,trixie-mule')
++        # def wait_online(self, *links_with_operstate, timeout='20s', bool_any=False, ipv4=False, ipv6=False, setup_state='configured', setup_timeout=5):
++        self.wait_online('veth99:routable', 'veth-peer:routable')
++        self.wait_address('veth99', r'inet 192.168.5.[0-9]*/24', ipv='-4')
++
++        state = get_dhcp4_client_state('veth99')
++        print(f"DHCPv4 client state = {state}")
++        self.assertEqual(state, 'bound')
++
++        output = read_dnsmasq_log_file()
++        self.assertIn('BOOTP(veth-peer)', output)
++        self.assertNotIn('DHCPDISCOVER(veth-peer)', output)
++        self.assertNotIn('DHCPOFFER(veth-peer)', output)
++        self.assertNotIn('DHCPREQUEST(veth-peer)', output)
++        self.assertNotIn('DHCPACK(veth-peer)', output)
++
+     def test_dhcp_client_use_dns(self):
+         def check(self, ipv4, ipv6):
+             os.makedirs(os.path.join(network_unit_dir, '25-dhcp-client.network.d'), exist_ok=True)
